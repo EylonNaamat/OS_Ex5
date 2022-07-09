@@ -18,21 +18,28 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <sys/mman.h>
-#define PORT "3491"  // the port users will be connecting to
+#include <sys/stat.h>
+#include <fcntl.h>
+#define PORT "3495"  // the port users will be connecting to
 
 #define BACKLOG 10   // how many pending connections queue will hold
 
 #define SIZE 10000
 
 
+int new_fd = 0;
+struct flock lock;
 
+int mem_fd = shm_open("stack_memory", O_CREAT | O_RDWR, 0);
 
-char* stack_beginning = (char*)(mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+char* stack_beginning = (char*)(mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, mem_fd, 0));
 //char* stack_head = stack_beginning;
 int* place = (int*)(mmap(NULL, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0));
 char* stack_end = stack_beginning + SIZE;
 
 bool push(char* data){
+   lock.l_type = F_WRLCK;
+   fcntl(mem_fd, F_SETLKW, &lock);
     int size_data = strlen(data);
     if(stack_beginning + (*place) + size_data + 1 > stack_end){
         return 0;
@@ -49,10 +56,14 @@ bool push(char* data){
     }
     stack_beginning[i+(*place)] = '\0';
     (*place) += i;
+   lock.l_type = F_UNLCK;
+   fcntl (mem_fd, F_SETLKW, &lock);
     return 1;
 }
 
 bool pop(){
+   lock.l_type = F_WRLCK;
+   fcntl (mem_fd, F_SETLKW, &lock);
     if(stack_beginning == stack_beginning + (*place)){
         return 0;
     }
@@ -60,13 +71,16 @@ bool pop(){
     while(stack_beginning[*place] != '\0'){
         (*place)--;
     }
+   lock.l_type = F_UNLCK;
+   fcntl (mem_fd, F_SETLKW, &lock);
     return 1;
 }
 
 void top(int* new_fd){
+   lock.l_type = F_WRLCK;
+   fcntl (mem_fd, F_SETLKW, &lock);
     if(stack_beginning == stack_beginning + (*place)){
-        char answer [1024] = "OUTPUT: stack is empty!!!";
-        printf("%s\n", answer);
+        char answer [1024] = "ERROR: stack is empty";
         send(*new_fd, answer, 1024, 0);
     }else{
         char answer [1024] = "OUTPUT: ";
@@ -79,8 +93,9 @@ void top(int* new_fd){
             tmp--;
         }
         answer[i] = '\0';
-        printf("%s\n", answer);
         send(*new_fd, answer, 1024, 0);
+        lock.l_type = F_UNLCK;
+        fcntl (mem_fd, F_SETLKW, &lock);
     }
 }
 
@@ -88,9 +103,7 @@ void sigchld_handler(int s)
 {
     // waitpid() might overwrite errno, so we save and restore it:
     int saved_errno = errno;
-
     while(waitpid(-1, NULL, WNOHANG) > 0);
-
     errno = saved_errno;
 }
 
@@ -106,15 +119,18 @@ void *get_in_addr(struct sockaddr *sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-//void sigint_handler(int num){
-//    printf("close client sockets\n");
-//    for(int i = 0; i < 10; ++i){
-//        close(new_fd[i]);
-//    }
-//    printf("closing mutex\n");
-//    pthread_mutex_destroy(&mutex);
-//    exit(1);
-//}
+void sigint_handler(int num){
+    close(new_fd);
+    if(munmap(stack_beginning, SIZE) < 0){
+        printf("error\n");
+    }
+    if(munmap(place, SIZE) < 0){
+        printf("error\n");
+    }
+    close(mem_fd);
+    shm_unlink("stack_memory");
+    exit(0);
+}
 
 int main(void)
 {
@@ -126,6 +142,13 @@ int main(void)
     int yes=1;
     char s[INET6_ADDRSTRLEN];
     int rv;
+
+   memset(&lock, 0, sizeof(lock));
+
+    if(mem_fd < 0){
+        printf("memory alloc failed\n");
+        exit(1);
+    }
 
     *place = 0;
     stack_beginning[*place] = '\0';
@@ -186,13 +209,13 @@ int main(void)
     printf("server: waiting for connections...\n");
 
 
-//    signal(SIGINT, sigint_handler);
+    signal(SIGINT, sigint_handler);
 
     int check = 0;
     while(1) {  // main accept() loop
         printf("%d\n", check);
         sin_size = sizeof their_addr;
-        int new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
+        new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size);
         if (new_fd == -1) {
             perror("accept");
             continue;
@@ -206,6 +229,7 @@ int main(void)
         if(fork() == 0){
             check++;
             char buf[2048];
+
             while(recv(new_fd, buf, 2048, 0) != -1){
                 size_t ln = strlen(buf)-1;
                 if (buf[ln] == '\n') {

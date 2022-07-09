@@ -13,7 +13,7 @@
 #include <arpa/inet.h>
 
 
-#define PORT_NUM 3491
+#define PORT_NUM 3495
 
 int main(){
     int my_sock = socket(AF_INET, SOCK_STREAM, 0);
